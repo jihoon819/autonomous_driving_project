@@ -1,0 +1,1171 @@
+#%%
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from waymo_open_dataset.protos import scenario_pb2
+from IPython.display import clear_output, display
+import matplotlib
+
+# --- [Bug Fix] Matplotlib 호환성 패치 ---
+if not hasattr(matplotlib.rcParams, '_get'):
+    matplotlib.rcParams._get = matplotlib.rcParams.get
+# ---------------------------------------
+
+TFRECORD_PATH = '/home/seclab_jihoon/auto_driving_project/uncompressed_scenario_validation_validation.tfrecord-00000-of-00150'
+DT = 0.1  # Waymo scenario is 10Hz
+
+import numpy as np
+
+DT = 0.1  # Waymo scenario time step (네 코드 기준)
+
+def curvature_3pt(p0, p1, p2, eps=1e-6):
+    """
+    3점으로 곡률 kappa 추정 (부호 포함)
+    kappa = 2*Area / (|p0p1|*|p1p2|*|p2p0|)
+    """
+    p0 = np.array(p0, dtype=float); p1 = np.array(p1, dtype=float); p2 = np.array(p2, dtype=float)
+    a = np.linalg.norm(p1 - p0)
+    b = np.linalg.norm(p2 - p1)
+    c = np.linalg.norm(p2 - p0)
+    if a < eps or b < eps or c < eps:
+        return 0.0
+
+    cross = (p1[0]-p0[0])*(p2[1]-p0[1]) - (p1[1]-p0[1])*(p2[0]-p0[0])
+    area2 = cross  # 2*Area with sign
+    kappa = area2 / (a*b*c) * 2.0
+    return float(kappa)
+
+def rolling_std(arr, w=20):
+    if len(arr) < 2:
+        return 0.0
+    x = np.array(arr[-w:], dtype=float)
+    return float(np.std(x))
+
+def compute_live_metrics(log, s_goal, d_th=1.5):
+    """
+    log: dict of lists with keys: t,s,d,v,x,y,kappa
+    returns: dict of metric scalars for HUD
+    """
+    n = len(log["t"])
+    if n == 0:
+        return {}
+
+    # 1) Ref 이탈 시간(프레임/초)
+    off_frames = int(np.sum(np.abs(np.array(log["d"])) > d_th))
+    off_time = off_frames * DT
+
+    # 2) 91프레임 내 진행도
+    s_now = float(log["s"][-1])
+    progress = float(s_now / max(s_goal, 1e-6))
+    remain = float(max(s_goal - s_now, 0.0))
+
+    # 3) 속도 안정성
+    v_now = float(log["v"][-1])
+    v_mean = float(np.mean(np.array(log["v"], dtype=float)))      # 전체 프레임 평균 속도
+    v_std = rolling_std(log["v"], w=20)                           # (선택) 2초 표준편차 유지
+
+    # 가속도/저크(선택)
+    a_now = 0.0
+    j_now = 0.0
+    if n >= 2:
+        a_now = (log["v"][-1] - log["v"][-2]) / DT
+    if n >= 3:
+        a_prev = (log["v"][-2] - log["v"][-3]) / DT
+        j_now = (a_now - a_prev) / DT
+
+    # 4) 곡률 안정성
+    k_now = float(log["kappa"][-1]) if len(log["kappa"]) else 0.0
+    k_abs = np.abs(np.array(log["kappa"], dtype=float)) if len(log["kappa"]) else np.array([0.0])
+    k_mean = float(np.mean(k_abs))                                # 전체 프레임 평균 |k|
+    k_max  = float(np.max(k_abs))
+    k_std  = rolling_std(k_abs.tolist(), w=20)                    # (선택) 2초 표준편차 유지
+
+
+    return {
+        "off_frames": off_frames,
+        "off_time": off_time,
+        "progress": progress,
+        "remain": remain,
+        "s_now": s_now,
+        "v_now": v_now,
+        "v_mean" : v_mean,
+        "v_std": v_std,
+        "a_now": float(a_now),
+        "j_now": float(j_now),
+        "k_now": k_now,
+        "k_max": k_max,
+        "k_std": k_std,
+        "k_mean" : k_mean,
+        "k_abs" : k_abs
+    }
+
+
+# =========================================================
+# 1) Load scenario
+# =========================================================
+def get_scenario(index):
+    dataset = tf.data.TFRecordDataset(TFRECORD_PATH, compression_type='')
+    for i, data in enumerate(dataset):
+        if i == index:
+            sc = scenario_pb2.Scenario()
+            sc.ParseFromString(data.numpy())
+            return sc
+    return None
+
+def rt_matrix(h):
+    return np.array([[np.cos(h), -np.sin(h)], [np.sin(h), np.cos(h)]])
+
+def global_to_local(camera_pose, points):
+    cx, cy, ch = camera_pose
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim == 1:
+        pts = pts.reshape(1, -1)
+    if len(pts) == 0:
+        return np.zeros((0, 2))
+    pts = pts - np.array([cx, cy])
+    R = rt_matrix(-(ch - np.pi/2))
+    return pts @ R.T
+
+STOP_GAP = 8.0       # Threat 뒤 정차 목표 gap (m)
+GOAL_ZONE_S = 25.0   # ref 끝에서 25m 이내면 목적지 근처로 간주
+LANE_WIDTH = 4.0
+
+def compute_goal_policy(base_goal_d, lane_cands, threat_obs, ref_s_end):
+    """
+    반환:
+      goal_mode: "LANE_GOAL" or "STOP_BEHIND"
+      goal_d: 목표 차선(d)
+      stop_s: STOP_BEHIND일 때 목표 정차 s (Threat 뒤)
+    """
+    if threat_obs is None:
+        return "LANE_GOAL", base_goal_d, None
+
+    # Threat이 목적지 근처까지 갔는지(끝단 클램프 포함)
+    threat_at_goal = (threat_obs["s"] >= (ref_s_end - GOAL_ZONE_S))
+
+    if not threat_at_goal:
+        return "LANE_GOAL", base_goal_d, None
+
+    # 옆 차선이 있으면 그걸 goal로 (threat 차선과 충분히 떨어진 lane)
+    if lane_cands:
+        candidates = [d for d in lane_cands if abs(d - threat_obs["d"]) > (LANE_WIDTH * 0.6)]
+        if candidates:
+            goal_d = min(candidates, key=lambda d: abs(d - base_goal_d))
+            return "LANE_GOAL", goal_d, None
+
+    # 옆 차선이 없으면: Threat 뒤 정차가 목표
+    stop_s = max(0.0, float(threat_obs["s"]) - STOP_GAP)
+    return "STOP_BEHIND", base_goal_d, stop_s
+
+
+def get_corners(x, y, h, l, w):
+    corners = np.array([[l/2, w/2], [l/2, -w/2], [-l/2, -w/2], [-l/2, w/2]])
+    return (corners @ rt_matrix(h).T) + np.array([x, y])
+
+def speed_of_state(st):
+    # Waymo TrackState has velocity_x/y
+    vx = getattr(st, "velocity_x", 0.0)
+    vy = getattr(st, "velocity_y", 0.0)
+    return float(np.hypot(vx, vy))
+
+def stabilize_lane_candidates(prev, curr, max_shift=1.5):
+    """
+    prev: 이전 프레임 lane centers (list)
+    curr: 현재 프레임 lane centers (list)
+    - curr가 갑자기 튀면 prev를 더 신뢰
+    """
+    if not curr:
+        return prev[:] if prev else []
+
+    if not prev:
+        return curr[:]
+
+    # 같은 개수/비슷한 위치면 curr 사용
+    # 너무 튀면(prev 대비) prev 유지 + curr 중 가까운 것만 반영
+    out = []
+    for p in prev:
+        nearest = min(curr, key=lambda c: abs(c - p))
+        if abs(nearest - p) <= max_shift:
+            out.append(nearest)
+        else:
+            out.append(p)
+
+    # curr에만 있는 후보 중 0 근처 하나 추가 허용
+    if all(abs(x) > 1.0 for x in out) and any(abs(c) < 1.0 for c in curr):
+        out.append(min(curr, key=lambda c: abs(c)))
+
+    out = sorted(set([round(x * 2) / 2 for x in out]))
+    out = sorted(out, key=lambda x: abs(x))[:3]
+    return out
+
+
+# =========================================================
+# 2) Reference Path (ego centerline)
+# =========================================================
+class ReferencePath:
+    def __init__(self, states):
+        self.x = np.array([s.center_x for s in states])
+        self.y = np.array([s.center_y for s in states])
+        self.h = np.array([s.heading for s in states])
+
+        self.s = np.zeros(len(self.x))
+        for i in range(1, len(self.x)):
+            self.s[i] = self.s[i-1] + np.hypot(self.x[i]-self.x[i-1], self.y[i]-self.y[i-1])
+        self.s_end = float(self.s[-1]) if len(self.s) > 0 else 0.0
+
+    def get_frenet(self, x, y):
+        dists = np.hypot(self.x - x, self.y - y)
+        idx = int(np.argmin(dists))
+        rx, ry, rh = self.x[idx], self.y[idx], self.h[idx]
+        dx, dy = x - rx, y - ry
+        # signed lateral (left positive if heading defines)
+        cross = np.cos(rh)*dy - np.sin(rh)*dx
+        return float(self.s[idx]), float(cross), float(rh)
+
+    def get_cartesian(self, s, d):
+        idx = int(np.searchsorted(self.s, s))
+        if idx <= 0:
+            idx = 0
+        if idx >= len(self.s):
+            idx = len(self.s) - 1
+        rx, ry, rh = self.x[idx], self.y[idx], self.h[idx]
+        nx, ny = -np.sin(rh), np.cos(rh)
+        return float(rx + nx*d), float(ry + ny*d), float(rh)
+
+# =========================================================
+# 3) Threat selection + threat behavior override
+# =========================================================
+class ThreatController:
+    def __init__(
+        self,
+        scenario,
+        ref_path,
+        start_frame=0,
+        ego_lane_d=0.0,
+        lane_width=4.0,
+        ego_s0=None,
+        merge_s_ratio=0.58,         # 시나리오 중간쯤
+        merge_trigger_dist=35.0,    # ego가 이 거리 이내로 접근하면 끼어들기 시작
+        merge_time=1.2,             # 끼어들기 시간
+        approach_d=None,            # None이면 왼쪽(-lane_width) 우선 시도
+    ):
+        self.scenario = scenario
+        self.ref = ref_path
+        self.start_frame = int(start_frame)
+
+        self.ego_lane_d = float(ego_lane_d)
+        self.lane_width = float(lane_width)
+
+        self.merge_trigger_dist = float(merge_trigger_dist)
+        self.merge_time = float(merge_time)
+
+        self.t = 0.0
+
+        # ego_s0 없으면 sdc frame0로 계산
+        if ego_s0 is None:
+            sdc_idx = int(self.scenario.sdc_track_index)
+            st0 = self.scenario.tracks[sdc_idx].states[self.start_frame]
+            ego_s0, _, _ = self.ref.get_frenet(float(st0.center_x), float(st0.center_y))
+        self.ego_s0 = float(ego_s0)
+
+        # merge_s를 "목적지 근처"가 아니라 ref 길이 중간으로 고정
+        s_end = float(self.ref.s_end)
+        raw_merge_s = s_end * float(merge_s_ratio)
+
+        # 너무 앞/뒤로 치우치지 않게 clamp (45%~70%)
+        lo = s_end * 0.45
+        hi = s_end * 0.70
+        self.merge_s = float(min(max(raw_merge_s, lo), hi))
+
+        # 끼어들기 시작 위치(옆 차선에서 등장)
+        if approach_d is None:
+            # 왼쪽 차선 우선(-lane_width). 없으면 오른쪽(+lane_width)
+            self.approach_d = float(self.ego_lane_d - self.lane_width)
+        else:
+            self.approach_d = float(approach_d)
+
+        self.mode = "WAIT"     # WAIT -> MERGE -> STOP
+        self._merge_t0 = None
+
+        # 상태 (s, d, v)
+        self.s = float(self.merge_s)
+        self.d = float(self.approach_d)
+        self.v = 0.0  # 정지 상태에서 대기
+
+        # 시각화용 물체 크기
+        self.L = 4.8
+        self.W = 2.1
+
+    def _smoothstep(self, u):
+        u = 0.0 if u < 0.0 else (1.0 if u > 1.0 else u)
+        return u*u*(3.0 - 2.0*u)
+
+    def step(self, ego_s, ego_v, frame):
+        dt = 0.1
+        self.t = (int(frame) - int(self.start_frame)) * dt
+
+        ego_s = float(ego_s)
+
+        MERGE_V_MAX_KMH = 12.0                 
+        MERGE_V_MAX = MERGE_V_MAX_KMH / 3.6    
+        STOP_DECEL = 2.0                       
+        MERGE_S_EXTRA = 8.0                    
+
+        if not hasattr(self, "_v_merge"):
+            self._v_merge = 0.0
+        if not hasattr(self, "_s_merge0"):
+            self._s_merge0 = float(self.merge_s)
+
+        def clamp(x, lo, hi):
+            return lo if x < lo else (hi if x > hi else x)
+
+        def smoothstep(u):
+            u = clamp(u, 0.0, 1.0)
+            return u*u*(3.0 - 2.0*u)
+
+        # 1) WAIT: 옆 차선에서 정지 대기
+        if self.mode == "WAIT":
+            self.s = float(self.merge_s)
+            self.d = float(self.approach_d)
+            self.v = 0.0
+            self._v_merge = 0.0
+            self._s_merge0 = float(self.merge_s)
+
+            if (self.merge_s - ego_s) < self.merge_trigger_dist:
+                self.mode = "MERGE"
+                self._merge_t0 = self.t
+                self._s_merge0 = float(self.s)
+                self._v_merge = 0.0
+
+        # 2) MERGE: 종방향 속도도 내면서 자연스럽게 합류
+        elif self.mode == "MERGE":
+            u = (self.t - float(self._merge_t0)) / float(self.merge_time)
+            a = smoothstep(u)
+
+            # d: 옆 차선 -> ego 차선
+            self.d = float(self.approach_d) + a * (float(self.ego_lane_d) - float(self.approach_d))
+
+            # v: 0 -> MERGE_V_MAX로 부드럽게 올림 (합류가 "앞으로도 가는" 느낌)
+            v_target = MERGE_V_MAX * a
+            # 가속 제한 (너무 튀지 않게)
+            acc = clamp((v_target - self._v_merge) / dt, -1.5, 1.5)
+            self._v_merge = max(0.0, self._v_merge + acc * dt)
+
+            # s: 합류 동안 MERGE_S_EXTRA 만큼 전진하는 형태로 자연스럽게 이동
+            # base: s_merge0 + (MERGE_S_EXTRA * a) + (적분된 v)
+            self.s = float(self._s_merge0) + MERGE_S_EXTRA * a
+            self.s += float(self._v_merge) * dt
+
+            # 합류 완료 시: STOP 상태로 전환하면서 ego 앞 충분히 확보
+            if u >= 1.0:
+                self.mode = "STOP"
+                self.d = float(self.ego_lane_d)
+
+                # 합류 완료 시점 위치를 ego 앞에 여유 있게 보정 (겹침 방지)
+                self.s = max(float(self.s), ego_s + 18.0)
+
+                # STOP으로 넘어갈 때 현재 merge 속도를 유지해서 "살짝 굴러가다 멈춤" 만들기
+                self.v = float(self._v_merge)
+
+        # 3) STOP: 합류 후 서서히 감속해서 정지 (정지 후 s 고정)
+        elif self.mode == "STOP":
+            self.d = float(self.ego_lane_d)
+
+            # 감속하며 정지
+            self.v = max(0.0, float(getattr(self, "v", 0.0)) - STOP_DECEL * dt)
+            self.s = float(self.s) + self.v * dt
+
+            # 완전히 멈추면 s 고정
+            if self.v < 0.05:
+                self.v = 0.0
+                # self.s 고정 (이후 더 안 움직임)
+
+        # 목적지 밖으로 나가지 않게만 clamp (사라지지 않게 end-0.5에서 고정)
+        s_max = float(self.ref.s_end) - 0.5
+        if self.s > s_max:
+            self.s = s_max
+            self.v = 0.0
+
+        # 투영
+        x, y, rh = self.ref.get_cartesian(self.s, self.d)
+
+        return {
+            "type": "red",
+            "s": float(self.s), "d": float(self.d),
+            "x": float(x), "y": float(y),
+            "h": float(rh),
+            "l": float(self.L), "w": float(self.W),
+            "vs": float(self.v),
+        }
+
+
+# =========================================================
+# 4) Obstacle manager: real obstacles + threat override
+# =========================================================
+def point_to_local(ego_x, ego_y, ego_h, px, py):
+    return global_to_local([ego_x, ego_y, ego_h], [[px, py]])[0]  # (lx, ly)
+
+class ObjectManager:
+    def __init__(
+        self,
+        scenario,
+        ref_path,
+        threat_ctrl=None,
+        start_frame=0,
+        remove_if_started_behind_m=2.0,
+        remove_if_behind_each_frame_m=5.0,
+        remove_if_overlap_m=6.0,   # 시작 프레임에서 ego와 이 거리 이내면 영구 제거
+    ):
+        self.scenario = scenario
+        self.ref = ref_path
+        self.threat_ctrl = threat_ctrl
+
+        self.start_frame = int(start_frame)
+        self.remove_if_started_behind_m = float(remove_if_started_behind_m)
+        self.remove_if_behind_each_frame_m = float(remove_if_behind_each_frame_m)
+        self.remove_if_overlap_m = float(remove_if_overlap_m)
+
+        # 핵심: sdc_track_index는 "tracks의 인덱스"
+        self.sdc_idx = int(self.scenario.sdc_track_index)
+
+        # 시작 프레임에서 ego 상태를 기준으로 "영구 제외" 트랙을 미리 계산
+        self._banned_track_idx = set()
+        self._precompute_bans()
+
+    def _precompute_bans(self):
+        f0 = self.start_frame
+        sdc_track = self.scenario.tracks[self.sdc_idx]
+        if f0 >= len(sdc_track.states):
+            return
+
+        ego0 = sdc_track.states[f0]
+        if not ego0.valid:
+            return
+
+        ego_x0 = float(ego0.center_x)
+        ego_y0 = float(ego0.center_y)
+        ego_s0, _, _ = self.ref.get_frenet(ego_x0, ego_y0)
+
+        for tidx, track in enumerate(self.scenario.tracks):
+            if tidx == self.sdc_idx:
+                continue
+            if f0 >= len(track.states):
+                self._banned_track_idx.add(tidx)
+                continue
+
+            st0 = track.states[f0]
+            if not st0.valid:
+                self._banned_track_idx.add(tidx)
+                continue
+
+            x0 = float(st0.center_x)
+            y0 = float(st0.center_y)
+
+            # 1) 시작 프레임에서 ego와 겹치거나 너무 가까우면 영구 제거
+            if np.hypot(x0 - ego_x0, y0 - ego_y0) < self.remove_if_overlap_m:
+                self._banned_track_idx.add(tidx)
+                continue
+
+            # 2) 시작 프레임에서 ego 뒤에서 출발하면 영구 제거
+            s0, _, _ = self.ref.get_frenet(x0, y0)
+            if float(s0) < float(ego_s0) - self.remove_if_started_behind_m:
+                self._banned_track_idx.add(tidx)
+                continue
+
+    def get_obstacles(self, ego_x, ego_y, ego_h, ego_s, ego_v, frame):
+        obstacles = []
+
+        # (1) Threat: controller 출력만 사용
+        tx = ty = None
+        if self.threat_ctrl is not None:
+            threat = self.threat_ctrl.step(
+                ego_s=float(ego_s),
+                ego_v=float(ego_v),
+                frame=int(frame)
+            )
+            if threat is not None:
+                obstacles.append(threat)
+                tx, ty = float(threat["x"]), float(threat["y"])
+
+        # (2) Gray: 주변 차량
+        for tidx, track in enumerate(self.scenario.tracks):
+            # 핵심: ego 트랙은 인덱스로 제외
+            if tidx == self.sdc_idx:
+                continue
+
+            # 시작 프레임 기준 영구 제외 트랙
+            if tidx in self._banned_track_idx:
+                continue
+
+            if frame >= len(track.states):
+                continue
+
+            st = track.states[frame]
+            if not st.valid:
+                continue
+
+            x = float(st.center_x)
+            y = float(st.center_y)
+
+            # Threat와 거의 겹치면 제거(중복 방지)
+            if tx is not None and np.hypot(x - tx, y - ty) < 3.0:
+                continue
+
+            # Frenet
+            s_obs, d_obs, _ = self.ref.get_frenet(x, y)
+
+            # 매 프레임: ego 뒤에 충분히 있으면 제거 (원하면 이 줄만 끄면 됨)
+            if float(s_obs) < float(ego_s) - self.remove_if_behind_each_frame_m:
+                continue
+
+            # 매 프레임: ego와 겹치면 제거(안전)
+            if np.hypot(x - float(ego_x), y - float(ego_y)) < 5.0:
+                continue
+
+            # 속도(vs)
+            vx = float(getattr(st, "velocity_x", 0.0))
+            vy = float(getattr(st, "velocity_y", 0.0))
+            vs = float(np.hypot(vx, vy))
+
+            obstacles.append({
+                "type": "gray",
+                "s": float(s_obs),
+                "d": float(d_obs),
+                "x": float(x),
+                "y": float(y),
+                "h": float(st.heading),
+                "l": float(st.length),
+                "w": float(st.width),
+                "vs": float(vs),
+            })
+
+        return obstacles
+
+# =========================================================
+# 5) Safe planner (collision-free candidate selection, else STOP)
+# =========================================================
+class SafePlanner:
+    def __init__(self, ref_path, init_s=0.0, init_d=0.0):
+        self.ref = ref_path
+
+        self.s = float(init_s)
+        self.d = float(init_d)
+        self.v = 0.0
+
+        self.x, self.y, self.h = ref_path.get_cartesian(self.s, self.d)
+
+        # 현재 목표 차선 (Frenet d)
+        self.target_d = float(init_d)
+
+        # ---- Overtake 상태 ----
+        self.overtake_active = False   # 추월 모드 여부
+        self.overtake_lane = None      # 추월 차선(d)
+        self.last_threat_s = None      # 마지막 threat s (추월 완료 판단용)
+
+
+    def _collision_frenet(self, s, d, obs):
+        # very simple inflated box in Frenet (works decently for lane-change logic)
+        # longitudinal buffer depends on lengths
+        L = 4.7
+        W = 2.0
+        lon = (L/2 + obs["l"]/2) + 1.5
+        lat = (W/2 + obs["w"]/2) + 0.8
+        return (abs(obs["s"] - s) < lon) and (abs(obs["d"] - d) < lat)
+
+    def plan(self, obstacles, lane_candidates, goal_d=0.0, goal_mode="LANE_GOAL", stop_s=None, threat=None):
+        dt = 0.1
+
+        # 상태변수 강제 초기화
+        self.step_i = getattr(self, "step_i", 0) + 1
+        self.overtake_active = getattr(self, "overtake_active", False)
+        self.overtake_lane = getattr(self, "overtake_lane", None)
+        self.overtake_commit_until = getattr(self, "overtake_commit_until", 0)
+        self.rejoin_commit_until = getattr(self, "rejoin_commit_until", 0)
+        self.last_threat_s = getattr(self, "last_threat_s", None)
+
+        lanes = list(lane_candidates) if lane_candidates else [0.0]
+        lanes = sorted(set(lanes))
+
+        # ref lane
+        ref_lane = min(lanes, key=lambda d: abs(float(d) - 0.0)) if lanes else 0.0
+
+        if threat is None:
+            threat = next((o for o in obstacles if o.get("type") == "red"), None)
+
+        # ----------------- 튜닝 -----------------
+        SAFE_D = 2.5
+        SAFE_S_AHEAD = 14.0
+        SAFE_S_BEHIND = 10.0
+
+        TRIGGER_GAP_STOP = 45.0
+        TRIGGER_GAP_MOVE = 28.0
+        PASS_MARGIN = 12.0
+
+        COMMIT_FRAMES = 24
+        REJOIN_COMMIT = 12
+
+        V_CRUISE = 15.0
+        V_OVERTAKE = 20.0
+
+        CREEP_V = 2.0
+
+        # ----------------- helpers -----------------
+        def min_front_gap_on_lane(lane_d, s0=None):
+            if s0 is None:
+                s0 = float(self.s)
+            gmin = 1e9
+            vfront = None
+            for obs in obstacles:
+                if abs(float(obs["d"]) - float(lane_d)) < SAFE_D and float(obs["s"]) > float(s0):
+                    g = float(obs["s"]) - float(s0)
+                    if g < gmin:
+                        gmin = g
+                        vfront = float(obs.get("vs", 1e9))
+            return gmin, vfront
+
+        def lane_is_safe(lane_d, aggressive=False):
+            if aggressive:
+                a_ahead = 9.0
+                a_behind = 6.0
+            else:
+                a_ahead = SAFE_S_AHEAD
+                a_behind = SAFE_S_BEHIND
+
+            for obs in obstacles:
+                if obs.get("type") == "red":
+                    continue
+                if abs(float(obs["d"]) - float(lane_d)) < SAFE_D:
+                    ds = float(obs["s"]) - float(self.s)
+                    if -a_behind < ds < a_ahead:
+                        return False
+            return True
+
+        def choose_overtake_lane(blocked_by_threat):
+            side = [d for d in lanes if abs(float(d) - float(ref_lane)) > 2.8]
+            if not side:
+                return None
+
+            scored = []
+            for d in side:
+                ok = lane_is_safe(d, aggressive=blocked_by_threat)
+                gap, _ = min_front_gap_on_lane(d)
+                score = float(gap) - (0.0 if ok else 300.0)
+                scored.append((score, float(d)))
+
+            scored.sort(reverse=True, key=lambda x: x[0])
+            return scored[0][1]  # <- “무조건” 하나 선택 (가드 제거)
+
+        # threat bookkeeping
+        if threat is not None:
+            self.last_threat_s = float(threat["s"])
+
+        # ----------------- blocked 판단 -----------------
+        blocked = False
+        blocked_by_threat = False
+
+        if threat is not None:
+            gap_t = float(threat["s"]) - float(self.s)
+            same_ref = abs(float(threat["d"]) - float(ref_lane)) < SAFE_D
+            th_v = float(threat.get("vs", 0.0))
+            trig = TRIGGER_GAP_STOP if th_v < 0.5 else TRIGGER_GAP_MOVE
+
+            if same_ref and 6.0 < gap_t < trig:
+                blocked = True
+                blocked_by_threat = True
+
+        ref_gap, _ = min_front_gap_on_lane(ref_lane)
+        if ref_gap < 12.0:
+            blocked = True
+
+        # ----------------- 추월 시작 -----------------
+        if (not self.overtake_active) and (goal_mode != "STOP_BEHIND") and blocked:
+            chosen = choose_overtake_lane(blocked_by_threat=blocked_by_threat)
+            if chosen is not None:
+                self.overtake_active = True
+                self.overtake_lane = float(chosen)
+                self.overtake_commit_until = self.step_i + COMMIT_FRAMES
+
+        # ----------------- 추월 종료/복귀 -----------------
+        if self.overtake_active and self.step_i >= self.overtake_commit_until:
+            ts = self.last_threat_s
+            if ts is not None and float(self.s) > float(ts) + PASS_MARGIN:
+                if lane_is_safe(ref_lane, aggressive=True):
+                    self.overtake_active = False
+                    self.overtake_lane = None
+                    self.rejoin_commit_until = self.step_i + REJOIN_COMMIT
+
+        force_ref = (self.step_i < self.rejoin_commit_until)
+
+        # ----------------- 평가 lane 결정 -----------------
+        if goal_mode == "STOP_BEHIND":
+            eval_lanes = [ref_lane]
+        else:
+            if force_ref:
+                eval_lanes = [ref_lane]
+            elif self.overtake_active and (self.overtake_lane is not None):
+                eval_lanes = [float(self.overtake_lane)]
+            else:
+                eval_lanes = [ref_lane]
+                if blocked:
+                    side = [d for d in lanes if abs(float(d) - float(ref_lane)) > 2.8]
+                    side = sorted(side, key=lambda d: abs(float(d) - float(ref_lane)))[:2]
+                    eval_lanes = [ref_lane] + side
+
+        # ----------------- 롤아웃 + 비용 -----------------
+        candidates = []
+        best_lane = None
+        best_cost = float("inf")
+
+        for lane in eval_lanes:
+            cost = 0.0
+            collision = False
+            traj = []
+
+            # ref 우선이지만 blocked면 side 허용
+            if abs(float(lane) - float(ref_lane)) < 0.25:
+                cost += 0.0
+            else:
+                cost += 180.0 if blocked else 1600.0
+
+            if self.overtake_active and self.overtake_lane is not None and abs(float(lane) - float(self.overtake_lane)) < 0.25:
+                cost -= 250.0
+
+            pred_s = float(self.s)
+            pred_d = float(self.d)
+            pred_v = float(self.v)
+
+            for _ in range(25):
+                front_gap, front_vs = min_front_gap_on_lane(lane, s0=pred_s)
+
+                desired_v = V_CRUISE
+                if front_gap < 25.0 and front_vs is not None:
+                    desired_v = min(desired_v, float(front_vs))
+                if front_gap < 12.0:
+                    desired_v = 0.0
+
+                # side lane이면 추월 속도
+                if abs(float(lane) - float(ref_lane)) > 2.8:
+                    desired_v = max(desired_v, V_OVERTAKE)
+
+                a = np.clip((desired_v - pred_v) * 0.9, -6.0, 2.5)
+                pred_v = max(0.0, pred_v + a * dt)
+
+                pred_s += pred_v * dt
+
+                # ★ 차선 변경을 더 빨리 (옆으로 안 가는 느낌 제거)
+                pred_d += (float(lane) - pred_d) * 0.55
+
+                gx, gy, _ = self.ref.get_cartesian(pred_s, pred_d)
+
+                for obs in obstacles:
+                    s_diff = float(obs["s"]) - pred_s
+                    d_diff = float(obs["d"]) - pred_d
+
+                    # ★ 핵심: side lane 평가 중 Threat 충돌 판정 완화
+                    if obs.get("type") == "red" and abs(float(lane) - float(ref_lane)) > 2.8:
+                        # lateral로 충분히 빠졌으면 Threat는 무시
+                        if abs(d_diff) > 1.6:
+                            continue
+                        # 아직 거의 ref 근처라면(초기 1~2스텝)만 충돌로 취급
+                        if -4.5 < s_diff < 7.0 and abs(d_diff) < 1.2:
+                            collision = True
+                            break
+                        # Threat에 대해서는 유클리드(원형) 체크도 하지 않음(과보수 방지)
+                        continue
+
+                    # 기본 충돌 체크(회색/기타)
+                    if -6.0 < s_diff < 6.0 and abs(d_diff) < 2.5:
+                        collision = True
+                        break
+
+                    r = 0.5 * 4.7 + 0.5 * float(obs["l"]) + 1.0
+                    if np.hypot(float(obs["x"]) - gx, float(obs["y"]) - gy) < r:
+                        collision = True
+                        break
+
+                if collision:
+                    break
+
+                traj.append([gx, gy])
+
+            if collision:
+                cost += 1e6
+
+            candidates.append({"lane": float(lane), "traj": np.array(traj, dtype=float), "cost": float(cost), "collision": bool(collision)})
+            if (not collision) and len(traj) > 0 and cost < best_cost:
+                best_cost = cost
+                best_lane = float(lane)
+
+        if best_lane is None:
+            best_lane = ref_lane
+
+        self.target_d = float(best_lane)
+
+        # ----------------- 최종 속도 -----------------
+        desired_v = V_OVERTAKE if (self.overtake_active and self.overtake_lane is not None) else V_CRUISE
+        front_gap, front_vs = min_front_gap_on_lane(self.target_d)
+
+        # blocked인데 추월이 안 잡히면 멈추지 말고 creep
+        if blocked and (not self.overtake_active) and front_gap < 12.0:
+            desired_v = CREEP_V
+        else:
+            if front_gap < 12.0:
+                desired_v = 0.0
+            elif front_gap < 25.0 and front_vs is not None:
+                desired_v = min(desired_v, float(front_vs))
+            else:
+                desired_v = max(desired_v, 13.0)
+
+        a = np.clip((desired_v - float(self.v)) * 1.0, -6.0, 2.0)
+        self.v = max(0.0, float(self.v) + a * dt)
+
+        self.s = float(self.s) + self.v * dt
+        self.d = float(self.d) + (float(self.target_d) - float(self.d)) * 0.22
+
+        self.x, self.y, road_h = self.ref.get_cartesian(self.s, self.d)
+        lat_v = (float(self.target_d) - float(self.d)) * 0.8
+        self.h = road_h + np.clip(np.arctan2(lat_v, 8.0), -0.25, 0.25)
+
+        return candidates
+
+
+
+    
+STOP_GAP = 8.0       # Threat 뒤 정차 목표 gap
+GOAL_ZONE_S = 25.0   # ref 끝에서 25m 이내면 "목적지 근처"
+LANE_WIDTH = 4.0
+
+def wrap_to_pi(a):
+    return (a + np.pi) % (2*np.pi) - np.pi
+
+def choose_goal_lane(base_goal_d, lane_cands, threat_obs, ref_s_end):
+    """
+    반환:
+      goal_mode: "LANE_GOAL" or "STOP_BEHIND"
+      goal_d: 목표 차선(d)
+      stop_s: STOP_BEHIND일 때 목표 정차 s (Threat 뒤)
+    """
+    if threat_obs is None:
+        return "LANE_GOAL", base_goal_d, None
+
+    # Threat이 목적지 근처(끝단)까지 가 있거나 끝단에 클램프된 상태면 blocked로 간주
+    threat_at_goal = threat_obs["s"] >= (ref_s_end - GOAL_ZONE_S)
+
+    if not threat_at_goal:
+        return "LANE_GOAL", base_goal_d, None
+
+    # 옆 차선 후보가 있으면 그걸 goal로
+    if lane_cands:
+        # base_goal_d와 가까운 순으로 보되, threat 차선과 충분히 떨어진 lane만
+        candidates = [d for d in lane_cands if abs(d - threat_obs["d"]) > (LANE_WIDTH * 0.6)]
+        if candidates:
+            goal_d = min(candidates, key=lambda d: abs(d - base_goal_d))
+            return "LANE_GOAL", goal_d, None
+
+    # 옆 차선이 없으면: Threat 뒤 정차가 목표
+    stop_s = max(0.0, threat_obs["s"] - STOP_GAP)
+    return "STOP_BEHIND", base_goal_d, stop_s
+
+def infer_lane_candidates_from_map(map_lines, ref_path, ego_s,
+                                   s_min_ahead=5.0, s_max_ahead=70.0,
+                                   lane_width=4.0, max_abs_d=12.0, max_out=5):
+    d_cands = []
+
+    s_lo = float(ego_s) + float(s_min_ahead)
+    s_hi = float(ego_s) + float(s_max_ahead)
+
+    for line in map_lines:
+        if line is None or len(line) < 20:
+            continue
+
+        ds = []
+        for p in line:
+            s, d, _ = ref_path.get_frenet(float(p[0]), float(p[1]))
+            if s_lo <= s <= s_hi:
+                ds.append(float(d))
+
+        if len(ds) < 25:
+            continue
+
+        ds = np.array(ds, dtype=float)
+
+        # 교차로/가로지르는 polyline 제거
+        if float(np.std(ds)) > 1.2:
+            continue
+
+        d_med = float(np.median(ds))
+        d_snap = round(d_med / lane_width) * lane_width
+
+        if abs(d_snap) > float(max_abs_d):
+            continue
+
+        d_cands.append(float(d_snap))
+
+    # unique
+    d_cands = sorted(set(d_cands))
+
+    # ref_lane 결정 (없으면 0)
+    if d_cands:
+        ref_lane = min(d_cands, key=lambda d: abs(d - 0.0))
+    else:
+        ref_lane = 0.0
+
+    # ---- 핵심: 좌/우 후보 강제 추가 ----
+    # map에서 우측만 잡혀도 좌측(ref-lane_width)을 추가
+    must = [ref_lane]
+    for k in [1, 2, 3]:
+        must.append(ref_lane + k * lane_width)
+        must.append(ref_lane - k * lane_width)
+
+    for d in must:
+        if abs(d) <= max_abs_d:
+            d_cands.append(float(d))
+
+    d_cands = sorted(set(d_cands))
+
+    # ---- balanced selection: [ref, nearest left, nearest right, next left, next right ...] ----
+    lefts  = sorted([d for d in d_cands if d < ref_lane - 1e-6], key=lambda d: abs(d - ref_lane))
+    rights = sorted([d for d in d_cands if d > ref_lane + 1e-6], key=lambda d: abs(d - ref_lane))
+
+    out = [float(ref_lane)]
+    k = 0
+    while len(out) < max_out and (k < len(lefts) or k < len(rights)):
+        if k < len(lefts):
+            out.append(float(lefts[k]))
+            if len(out) >= max_out:
+                break
+        if k < len(rights):
+            out.append(float(rights[k]))
+            if len(out) >= max_out:
+                break
+        k += 1
+
+    return out
+
+
+def plan(self, obstacles, lane_candidates):
+    lane_offsets = lane_candidates[:]  # 여기를 사용
+    if len(lane_offsets) == 0:
+        lane_offsets = [self.d, 0.0]
+
+
+# =========================================================
+# 6) Simulation loop
+# =========================================================
+def run_simulation(idx=0, n_frames=91):
+    sc = get_scenario(idx)
+    if sc is None:
+        print("Scenario not found")
+        return
+
+    # 0) map_lines (lane only)
+    map_lines = []
+    for f in sc.map_features:
+        if f.HasField("lane") and len(f.lane.polyline) > 1:
+            map_lines.append(np.array([[p.x, p.y] for p in f.lane.polyline], dtype=float))
+
+    # 1) ref + ego init
+    sdc_idx = int(sc.sdc_track_index)
+    ref_path = ReferencePath(sc.tracks[sdc_idx].states)
+
+    scenario_frames = len(sc.timestamps_seconds) if hasattr(sc, "timestamps_seconds") and len(sc.timestamps_seconds) > 0 else len(sc.tracks[sdc_idx].states)
+    n_frames = min(int(n_frames), int(scenario_frames))
+
+    sdc0 = sc.tracks[sdc_idx].states[0]
+    ego_s0, ego_d0, _ = ref_path.get_frenet(sdc0.center_x, sdc0.center_y)
+    ego_v0 = speed_of_state(sdc0)
+
+    ego = SafePlanner(ref_path, init_s=ego_s0, init_d=ego_d0)
+    ego.v = max(0.0, float(ego_v0))
+
+    # 2) threat + objects
+    threat_ctrl = ThreatController(
+        sc, ref_path,
+        start_frame=0,
+        ego_lane_d=0.0,
+        lane_width=4.0,
+        ego_s0=ego_s0,
+        merge_s_ratio=0.58,
+        merge_trigger_dist=35.0,
+        merge_time=1.2,
+        approach_d=-4.0
+    )
+
+    obj_mgr = ObjectManager(
+        sc, ref_path, threat_ctrl,
+        start_frame=0,
+        remove_if_started_behind_m=2.0,
+        remove_if_behind_each_frame_m=5.0
+    )
+    print(f"[Threat] track_idx={getattr(threat_ctrl,'threat_track_idx',None)}, mode={getattr(threat_ctrl,'mode',None)}")
+
+    # 3) figure 고정
+    plt.ioff()
+    fig, ax = plt.subplots(figsize=(8, 8), dpi=120)
+    fig.subplots_adjust(left=0.03, right=0.97, bottom=0.03, top=0.97)
+    handle = display(fig, display_id=True)
+
+    base_goal_d = 0.0
+    prev_lane_cands = []
+
+    # =========================
+    # METRICS ADD (init)
+    # =========================
+    s_goal = float(ref_path.s_end)  # 목적지 s (간단히 ref 끝)
+    log = {"t": [], "s": [], "d": [], "v": [], "x": [], "y": [], "kappa": []}
+
+    for frame in range(n_frames):
+        ax.clear()
+
+        # camera pose (for drawing)
+        _, _, cam_h = ref_path.get_cartesian(ego.s, 0.0)
+        camera_pose = [ego.x, ego.y, cam_h]
+
+        # A) lane candidates in Frenet d (meters)
+        lane_raw = infer_lane_candidates_from_map(
+            map_lines, ref_path, ego.s,
+            s_min_ahead=5.0, s_max_ahead=70.0,
+            lane_width=4.0
+        )
+        lane_cands = stabilize_lane_candidates(prev_lane_cands, lane_raw)
+        prev_lane_cands = lane_cands[:]
+
+        if not lane_cands:
+            lane_cands = [0.0]
+
+        # B) clamp ego state to nearest lane cand (prevents off-lane drifting)
+        nearest = min(lane_cands, key=lambda d: abs(float(d) - float(ego.d)))
+        if abs(float(ego.d) - float(nearest)) > 1.8:
+            ego.d = float(nearest)
+            ego.target_d = float(nearest)
+
+        # C) obstacles (gray are in Frenet d too)
+        obstacles = obj_mgr.get_obstacles(
+            ego_x=ego.x, ego_y=ego.y, ego_h=cam_h,
+            ego_s=ego.s, ego_v=ego.v,
+            frame=frame
+        )
+
+        # D) goal policy (destination blocked by Threat)
+        threat_obs = next((o for o in obstacles if o.get("type") == "red"), None)
+        goal_mode, goal_d, stop_s = compute_goal_policy(base_goal_d, lane_cands, threat_obs, ref_path.s_end)
+
+        # E) plan
+        candidates = ego.plan(
+            obstacles, lane_cands,
+            goal_d=goal_d,
+            goal_mode=goal_mode,
+            stop_s=stop_s,
+            threat=threat_obs
+        )
+
+        # -------- draw map (for visualization only) --------
+        for line in map_lines:
+            if len(line) == 0:
+                continue
+            if np.linalg.norm(line[0] - np.array([ego.x, ego.y])) > 180:
+                continue
+            local = global_to_local(camera_pose, line)
+            ax.plot(local[:, 0], local[:, 1], "k-", alpha=0.25, linewidth=1)
+
+        # -------- draw ref centerline --------
+        ref_pts = []
+        for ss in np.arange(ego.s - 20.0, ego.s + 90.0, 2.0):
+            rx, ry, _ = ref_path.get_cartesian(ss, 0.0)
+            ref_pts.append([rx, ry])
+        local_ref = global_to_local(camera_pose, ref_pts)
+        ax.plot(local_ref[:, 0], local_ref[:, 1], "c--", alpha=0.85, linewidth=2)
+
+        # -------- draw candidates --------
+        best_cost = min([c["cost"] for c in candidates]) if candidates else 1e9
+        for c in candidates:
+            traj = c.get("traj", None)
+            if traj is None or len(traj) == 0:
+                continue
+            local_traj = global_to_local(camera_pose, traj)
+            if c.get("collision", False):
+                ax.plot(local_traj[:, 0], local_traj[:, 1], "r", alpha=0.30, linewidth=2)
+            elif c["cost"] == best_cost:
+                ax.plot(local_traj[:, 0], local_traj[:, 1], "lime", alpha=0.90, linewidth=3)
+            else:
+                ax.plot(local_traj[:, 0], local_traj[:, 1], "gray", alpha=0.35, linewidth=2)
+
+        # -------- draw obstacles --------
+        for obs in obstacles:
+            corners = get_corners(obs["x"], obs["y"], obs["h"], obs["l"], obs["w"])
+            local = global_to_local(camera_pose, corners)
+            poly = patches.Polygon(local, closed=True, facecolor=obs["type"], edgecolor="k", alpha=0.9, zorder=6)
+            ax.add_patch(poly)
+
+        # -------- draw ego --------
+        ego_c = get_corners(ego.x, ego.y, ego.h, 4.7, 2.0)
+        local_ego = global_to_local(camera_pose, ego_c)
+        ax.add_patch(patches.Polygon(local_ego, closed=True, facecolor="dodgerblue", edgecolor="blue", zorder=10))
+
+        # =========================
+        # METRICS ADD (per-frame logging + HUD metrics)
+        # =========================
+        t = frame * DT
+        log["t"].append(float(t))
+        log["s"].append(float(ego.s))
+        log["d"].append(float(ego.d))
+        log["v"].append(float(ego.v))
+        log["x"].append(float(ego.x))
+        log["y"].append(float(ego.y))
+
+        if len(log["x"]) >= 3:
+            p0 = (log["x"][-3], log["y"][-3])
+            p1 = (log["x"][-2], log["y"][-2])
+            p2 = (log["x"][-1], log["y"][-1])
+            log["kappa"].append(curvature_3pt(p0, p1, p2))
+        else:
+            log["kappa"].append(0.0)
+
+        m = compute_live_metrics(log, s_goal=s_goal, d_th=1.5)
+
+        # threat 참고값(없으면 None)
+        if threat_obs is not None:
+            th_gap = float(threat_obs["s"]) - float(ego.s)
+            th_v_kmh = float(threat_obs.get("vs", 0.0)) * 3.6
+        else:
+            th_gap = 999.0
+            th_v_kmh = 0.0
+
+        # 기존 HUD + 성능지표 HUD (텍스트만)
+        hud = (
+            f"frame={frame:03d} | v={ego.v*3.6:05.1f} km/h | target_d={ego.target_d:5.2f} | "
+            f"goal={goal_mode} | goal_d={goal_d:5.2f} | stop_s={stop_s} | lanes(d)={lane_cands}\n"
+            f"[Eval] progress={m['progress']*100:5.1f}%  remain_s={m['remain']:6.1f}m  "
+            f"offRef(|d|>1.5)={m['off_frames']:3d}f({m['off_time']:4.1f}s)\n"
+            f"[Stab] v_std(2s)={m['v_std']*3.6:4.1f}km/h  a={m['a_now']:5.2f}  j={m['j_now']:6.2f}  "
+            f"|k|_std(2s)={m['k_std']:.3f}  |k|_max={m['k_max']:.3f}\n"
+            f"[Threat] gap={th_gap:5.1f}m  v={th_v_kmh:4.1f}km/h"
+        )
+        ax.text(-29, 58, hud, fontsize=8.5, va="top",
+                bbox=dict(facecolor="white", alpha=0.87, edgecolor="none"))
+
+        ax.set_xlim(-30, 30)
+        ax.set_ylim(-20, 60)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.2)
+
+        fig.canvas.draw_idle()
+        handle.update(fig)
+
+    # =========================
+    # METRICS ADD (final summary print)
+    # =========================
+    m = compute_live_metrics(log, s_goal=s_goal, d_th=1.5)
+    print("\n=== Summary (within n_frames) ===")
+    print(f"Progress @end: {m['progress']*100:.1f}% (s={m['s_now']:.1f} / {s_goal:.1f})")
+    print(f"OffRef(|d|>1.5m): {m['off_time']:.1f}s ({m['off_frames']} frames)")
+    print(f"v_mean(all)={m['v_mean']*3.6:5.1f} km/h  v_std(2s)={m['v_std']*3.6:4.1f} km/h")
+    print(f"|k|_mean(all)={m['k_mean']:.3f}  |k|_max={m['k_max']:.3f}  |k|_std(2s)={m['k_std']:.3f}")
+
+
+
+if __name__ == "__main__":
+    run_simulation(60, n_frames=91)
+
+#%%
